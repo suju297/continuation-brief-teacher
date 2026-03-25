@@ -54,6 +54,16 @@ JUDGE_SCORE_FIELDS = (
 JUDGE_TEXT_FIELDS = ("strengths", "issues")
 JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
 THINK_BLOCK_PATTERN = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+FATAL_TEACHER_ISSUES = {
+    "empty or near-empty normalized output",
+    "prompt echo in opening text",
+    "contains placeholder bullet",
+    "obvious unusable scaffolding",
+}
+STRUCTURE_ONLY_TEACHER_ISSUES = {
+    "section coverage below 4/8 required content headers",
+    "missing both continuation tail anchors",
+}
 
 
 @dataclass
@@ -130,7 +140,7 @@ def model_kwargs(model_id: str, quantization: str, device_index: int) -> dict[st
     settings = tr.resolve_model_load_settings(device_index)
     kwargs: dict[str, Any] = {
         "trust_remote_code": True,
-        "torch_dtype": settings["torch_dtype"],
+        "dtype": settings["torch_dtype"],
         "attn_implementation": settings["attn_implementation"],
         "low_cpu_mem_usage": True,
     }
@@ -287,15 +297,17 @@ class HFChatModel:
         generated = None
         new_tokens = None
         try:
+            generation_kwargs: dict[str, Any] = {
+                **inputs,
+                "do_sample": self.temperature > 0,
+                "max_new_tokens": max_new_tokens or self.max_new_tokens,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+            }
+            if self.temperature > 0:
+                generation_kwargs["temperature"] = max(self.temperature, 1e-5)
             with torch.inference_mode():
-                generated = self.model.generate(
-                    **inputs,
-                    do_sample=self.temperature > 0,
-                    temperature=max(self.temperature, 1e-5),
-                    max_new_tokens=max_new_tokens or self.max_new_tokens,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
+                generated = self.model.generate(**generation_kwargs)
             new_tokens = generated[:, inputs["input_ids"].shape[1] :]
             return self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0]
         finally:
@@ -322,6 +334,127 @@ class TeacherGeneratorAdapter(HFChatModel):
             max_new_tokens=max_new_tokens,
             enable_thinking=bool(capture_rationale),
         )
+
+
+def _teacher_issue_set(candidate_status: str, issues: list[str]) -> set[str]:
+    if candidate_status != "hard_reject":
+        return set()
+    return {str(issue).strip() for issue in issues if str(issue).strip()}
+
+
+def _teacher_candidate_is_usable(candidate_status: str, issues: list[str], brief: str) -> bool:
+    if not brief.strip():
+        return False
+    issue_set = _teacher_issue_set(candidate_status, issues)
+    if not issue_set:
+        return True
+    return not any(issue in FATAL_TEACHER_ISSUES for issue in issue_set)
+
+
+def _quality_first_status(candidate_status: str, issues: list[str], brief: str) -> str:
+    if candidate_status != "hard_reject":
+        return candidate_status
+    if _teacher_candidate_is_usable(candidate_status, issues, brief):
+        return "soft_accept"
+    return "hard_reject"
+
+
+def generate_teacher_draft_quality_first(
+    *,
+    generator: TeacherGeneratorAdapter,
+    row: dict[str, Any],
+    capture_rationale: bool,
+    prompt_method: str,
+) -> tr.GenerationOutcome:
+    attempts = tr.build_generation_attempts(generator.max_new_tokens)
+    last_oom_error: RuntimeError | None = None
+    started_at = time.time()
+    attempt_debug_records: list[dict[str, Any]] = []
+    best_outcome: tr.GenerationOutcome | None = None
+
+    for attempt_index, attempt in enumerate(attempts, start=1):
+        prompt = tr.build_prompt(
+            row,
+            capture_rationale,
+            prompt_method=prompt_method,
+            transcript_char_budget=attempt["transcript_char_budget"],
+        )
+        try:
+            raw_output = generator.generate(
+                prompt,
+                capture_rationale,
+                max_new_tokens=attempt["max_new_tokens"],
+            )
+            brief_text, auxiliary_rationale = tr.split_model_output(raw_output)
+            brief = tr.normalize_generated_brief(brief_text)
+            candidate_status, issues = tr.classify_generated_brief(brief)
+            chosen_status = _quality_first_status(candidate_status, issues, brief)
+
+            debug_record = {
+                "attemptIndex": attempt_index,
+                "transcriptCharBudget": attempt["transcript_char_budget"],
+                "maxNewTokens": attempt["max_new_tokens"],
+                "promptLength": len(prompt),
+                "promptPreview": tr.trim_debug_text(prompt),
+                "rawOutput": tr.trim_debug_text(raw_output),
+                "normalizedBrief": tr.trim_debug_text(brief),
+                "structureStatus": candidate_status,
+                "structureIssues": list(issues),
+                "chosenStatus": chosen_status,
+            }
+            attempt_debug_records.append(debug_record)
+
+            current_outcome = tr.GenerationOutcome(
+                brief=brief,
+                raw_output=raw_output,
+                auxiliary_rationale=auxiliary_rationale,
+                status=chosen_status,
+                issues=list(issues),
+                debug_payload={
+                    "attempts": list(attempt_debug_records),
+                    "chosenStatus": chosen_status,
+                    "chosenIssues": list(issues),
+                    "structureStatus": candidate_status,
+                    "structureIssues": list(issues),
+                },
+                duration_ms=round((time.time() - started_at) * 1000),
+            )
+
+            if best_outcome is None or len(brief) > len(best_outcome.brief):
+                best_outcome = current_outcome
+
+            if chosen_status != "hard_reject":
+                if candidate_status != "format_clean":
+                    print(
+                        f"quality-first accept for '{row.get('title', '')}' on attempt {attempt_index}/{len(attempts)}: "
+                        f"structure_status={candidate_status}; {tr.summarize_issues(issues)}",
+                        flush=True,
+                    )
+                return current_outcome
+
+            print(
+                f"quality-first retry for '{row.get('title', '')}' on attempt {attempt_index}/{len(attempts)}: "
+                f"{tr.summarize_issues(issues)}",
+                flush=True,
+            )
+        except RuntimeError as exc:
+            if not tr.is_cuda_oom_error(exc):
+                raise
+            last_oom_error = exc
+            print(
+                "OOM while generating "
+                f"'{row.get('title', '')}' on attempt {attempt_index}/{len(attempts)}; "
+                f"retrying with transcript_char_budget={attempt['transcript_char_budget']} "
+                f"and max_new_tokens={attempt['max_new_tokens']}",
+                flush=True,
+            )
+            tr.clear_torch_memory(generator.device)
+
+    if best_outcome is not None:
+        return best_outcome
+    if last_oom_error is not None:
+        raise RuntimeError(f"{last_oom_error} after {len(attempts)} memory-recovery attempts.") from last_oom_error
+    raise RuntimeError("Teacher draft generation exhausted all attempts without producing output.")
 
 
 class JudgeModel(HFChatModel):
@@ -559,6 +692,9 @@ def build_summary(
     status: str,
 ) -> dict[str, Any]:
     teacher_status_counts = Counter(str(row.get("teacher_generation_status", "")) for row in rows if row.get("teacher_generation_status"))
+    teacher_structure_status_counts = Counter(
+        str(row.get("teacher_structure_status", "")) for row in rows if row.get("teacher_structure_status")
+    )
     judge_status_counts = Counter(str(row.get("teacher_judge_status", "")) for row in rows if row.get("teacher_judge_status"))
     quality_rows = quality_first_metric_rows(rows)
     summary = {
@@ -580,6 +716,7 @@ def build_summary(
         "judgeGpu": args.judge_gpu,
         "promptMethod": args.prompt_method,
         "teacherStatusCounts": dict(sorted(teacher_status_counts.items())),
+        "teacherStructureStatusCounts": dict(sorted(teacher_structure_status_counts.items())),
         "judgeStatusCounts": dict(sorted(judge_status_counts.items())),
         "teacherAverageDurationMs": mean_dict(rows, "teacher_generation_duration_ms"),
         "judgeAverageDurationMs": mean_dict(rows, "teacher_judge_duration_ms"),
@@ -659,7 +796,7 @@ def run_pipeline(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[s
             next_row = dict(row)
             if teacher is not None:
                 try:
-                    outcome = tr.generate_teacher_draft(
+                    outcome = generate_teacher_draft_quality_first(
                         generator=teacher,
                         row=row,
                         capture_rationale=args.capture_rationale,
@@ -675,6 +812,10 @@ def run_pipeline(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[s
                         auxiliary_rationale=outcome.auxiliary_rationale,
                         brief=outcome.brief,
                         raw_output=outcome.raw_output,
+                    )
+                    next_row["teacher_structure_status"] = str(outcome.debug_payload.get("structureStatus", outcome.status))
+                    next_row["teacher_structure_issues"] = list(
+                        outcome.debug_payload.get("structureIssues", outcome.issues)
                     )
                     if outcome.status == "hard_reject":
                         append_debug_record(
