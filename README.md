@@ -13,6 +13,9 @@ Kaggle setup:
 4. Run the smoke cells first.
 5. Enable the full run only after smoke passes.
 
+Current default input override:
+- `/kaggle/input/datasets/sujendragharat/qwen-4b-teacher-2gpu-inputs-new`
+
 Notes:
 - The notebook keeps the existing merged JSON and summary output schema.
 - The notebook is sequential and avoids the older 2-GPU shard launcher path.
